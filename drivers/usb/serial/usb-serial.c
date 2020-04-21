@@ -1212,6 +1212,10 @@ static struct usb_driver usb_serial_driver = {
 	.resume =	usb_serial_resume,
 	.no_dynamic_id =	1,
 	.supports_autosuspend =	1,
+#if 1 //add by Quectel
+	.reset_resume   = usb_serial_resume,
+#endif
+	
 };
 
 static int __init usb_serial_init(void)

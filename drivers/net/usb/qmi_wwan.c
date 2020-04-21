@@ -56,29 +56,54 @@ struct qmi_wwan_state {
 /* default ethernet address used by the modem */
 static const u8 default_modem_addr[ETH_ALEN] = {0x02, 0x50, 0xf3};
 
-/* Make up an ethernet header if the packet doesn't have one.
- *
- * A firmware bug common among several devices cause them to send raw
- * IP packets under some circumstances.  There is no way for the
- * driver/host to know when this will happen.  And even when the bug
- * hits, some packets will still arrive with an intact header.
- *
- * The supported devices are only capably of sending IPv4, IPv6 and
- * ARP packets on a point-to-point link. Any packet with an ethernet
- * header will have either our address or a broadcast/multicast
- * address as destination.  ARP packets will always have a header.
- *
- * This means that this function will reliably add the appropriate
- * header iff necessary, provided our hardware address does not start
- * with 4 or 6.
- *
- * Another common firmware bug results in all packets being addressed
- * to 00:a0:c6:00:00:00 despite the host address being different.
- * This function will also fixup such packets.
- */
+#if 1 //add by Quectel
+#include <linux/etherdevice.h>
+#include <net/ip.h>
+#include <net/ipv6.h>
+struct sk_buff *qmi_wwan_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
+{
+	const struct ethhdr *ehdr;
+
+	skb_reset_mac_header(skb);
+	ehdr = eth_hdr(skb);
+
+	if (ehdr->h_proto == htons(ETH_P_IP)) {
+		if (unlikely(skb->len <= (sizeof(struct ethhdr) + sizeof(struct iphdr)))) {
+			goto drop_skb;
+		}
+	}
+	else if (ehdr->h_proto == htons(ETH_P_IPV6)) {
+		if (unlikely(skb->len <= (sizeof(struct ethhdr) + sizeof(struct ipv6hdr)))) {
+			goto drop_skb;
+		}
+	}
+	else {
+		dev_err(&dev->intf->dev,  "skb h_proto is %04x\n", ntohs(ehdr->h_proto));
+		goto drop_skb;
+	}
+
+	if (unlikely(dev->udev->descriptor.idVendor != cpu_to_le16(0x2C7C)))
+		return skb;
+
+	// Skip Ethernet header from message
+	if (likely((skb_pull(skb, ETH_HLEN))))
+		return skb;
+
+drop_skb:
+	dev_err(&dev->intf->dev,  "Packet Dropped\n");
+	// Filter the packet out, release it
+	dev_kfree_skb_any(skb);
+	return NULL;
+}
+
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE < KERNEL_VERSION( 3,9,1 ))
 static int qmi_wwan_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 {
 	__be16 proto;
+
+	if (dev->udev->descriptor.idVendor != cpu_to_le16(0x2C7C))
+		return 1;
 
 	/* This check is no longer done by usbnet */
 	if (skb->len < dev->net->hard_header_len)
@@ -111,6 +136,8 @@ fix_dest:
 	memcpy(eth_hdr(skb)->h_dest, dev->net->dev_addr, ETH_ALEN);
 	return 1;
 }
+#endif
+#endif
 
 /* very simplistic detection of IPv4 or IPv6 headers */
 static bool possibly_iphdr(const char *data)
@@ -344,6 +371,20 @@ next_desc:
 		dev->net->dev_addr[0] &= 0xbf;	/* clear "IP" bit */
 	}
 	dev->net->netdev_ops = &qmi_wwan_netdev_ops;
+#if 1 //add by Quectel
+	if (dev->udev->descriptor.idVendor == cpu_to_le16(0x2C7C)) {
+		dev_info(&intf->dev, "Quectel EC21&EC25 work on RawIP mode\n");
+		dev->net->flags |= IFF_NOARP;
+		usb_control_msg(
+			interface_to_usbdev(intf),
+			usb_sndctrlpipe(interface_to_usbdev(intf), 0),
+			0x22,
+			0x21,
+			1, //active CDC DTR
+			intf->cur_altsetting->desc.bInterfaceNumber,
+			NULL, 0, 100);
+		}
+#endif	
 err:
 	return status;
 }
@@ -428,7 +469,13 @@ static const struct driver_info	qmi_wwan_info = {
 	.bind		= qmi_wwan_bind,
 	.unbind		= qmi_wwan_unbind,
 	.manage_power	= qmi_wwan_manage_power,
+#if 1 //add by Quectel
+	.tx_fixup       = qmi_wwan_tx_fixup,
+#if (LINUX_VERSION_CODE < KERNEL_VERSION( 3,9,1 ))
 	.rx_fixup       = qmi_wwan_rx_fixup,
+#endif
+#endif
+
 };
 
 #define HUAWEI_VENDOR_ID	0x12D1
@@ -447,6 +494,24 @@ static const struct driver_info	qmi_wwan_info = {
 	QMI_FIXED_INTF(vend, prod, 0)
 
 static const struct usb_device_id products[] = {
+#if 1 //Added by Quectel
+#ifndef QMI_FIXED_INTF
+/* map QMI/wwan function by a fixed interface number */
+#define QMI_FIXED_INTF(vend, prod, num) \
+	.match_flags = USB_DEVICE_ID_MATCH_DEVICE | USB_DEVICE_ID_MATCH_INT_INFO, \
+	.idVendor = vend, \
+	.idProduct = prod, \
+	.bInterfaceClass = 0xff, \
+	.bInterfaceSubClass = 0xff, \
+	.bInterfaceProtocol = 0xff, \
+	.driver_info = (unsigned long)&qmi_wwan_force_int##num,
+#endif
+	{ QMI_FIXED_INTF(0x05C6, 0x9003, 4) }, /* Quectel UC20 */
+	{ QMI_FIXED_INTF(0x05C6, 0x9215, 4) }, /* Quectel EC20 */
+	{ QMI_FIXED_INTF(0x2C7C, 0x0125, 4) }, /* Quectel EC25/EC20 R2.0 */
+	{ QMI_FIXED_INTF(0x2C7C, 0x0121, 4) }, /* Quectel EC21 */
+#endif
+
 	/* 1. CDC ECM like devices match on the control interface */
 	{	/* Huawei E392, E398 and possibly others sharing both device id and more... */
 		USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, USB_CLASS_VENDOR_SPEC, 1, 9),
